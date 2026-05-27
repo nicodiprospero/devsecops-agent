@@ -1,0 +1,17 @@
+# Core framework
+agno>=2.6.0
+
+# Gemini model provider (required by agno.models.google)
+google-genai>=1.0.0
+
+# Web interface
+flask>=3.0.0
+
+# CLI formatting
+rich>=13.7.0
+
+# HTTP client used by tools (OSV.dev, GitHub API)
+requests>=2.31.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
