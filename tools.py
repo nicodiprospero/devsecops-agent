@@ -12,6 +12,26 @@ from pathlib import Path
 
 import requests
 
+# When ALLOW_LOCAL_SCAN is not set, restrict local-path tools to the uploads sandbox.
+_UPLOADS_ROOT = Path(tempfile.gettempdir()) / "vibesec_uploads"
+_ALLOW_LOCAL_SCAN = os.getenv("ALLOW_LOCAL_SCAN", "").lower() in ("1", "true", "yes")
+
+
+def _assert_safe_path(path: str) -> str | None:
+    """Returns an error string if the path escapes the sandbox, else None."""
+    if _ALLOW_LOCAL_SCAN:
+        return None
+    try:
+        resolved = Path(path).resolve()
+        _UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+        resolved.relative_to(_UPLOADS_ROOT.resolve())
+        return None
+    except ValueError:
+        return (
+            "For security reasons, VibeSec can only scan files you upload through the "
+            "interface — not arbitrary paths on the server. Upload the file and try again."
+        )
+
 
 # ── Secret Scanner ─────────────────────────────────────────────────────────────
 
@@ -71,6 +91,10 @@ def scan_secrets(path: str) -> str:
         A report listing every credential found, where it is, and what to do.
         If nothing is found, confirms the scan completed cleanly.
     """
+    err = _assert_safe_path(path)
+    if err:
+        return err
+
     target = Path(path)
     if not target.exists():
         return f"Can't find that path: {path}. Double-check the location and try again."
@@ -179,6 +203,10 @@ def audit_dependencies(requirements_path: str) -> str:
         A plain-English report of which packages have security problems,
         what those problems mean for your app, and exactly how to fix them.
     """
+    err = _assert_safe_path(requirements_path)
+    if err:
+        return err
+
     req_path = Path(requirements_path)
     if not req_path.exists():
         return f"Can't find that file: {requirements_path}. Check the path and try again."
@@ -349,6 +377,10 @@ def analyze_dockerfile(dockerfile_path: str) -> str:
         A list of issues found with plain-English explanations and fixes.
         Returns a clean pass if no problems are detected.
     """
+    err = _assert_safe_path(dockerfile_path)
+    if err:
+        return err
+
     df_path = Path(dockerfile_path)
     if not df_path.exists():
         return f"Can't find that Dockerfile: {dockerfile_path}. Check the path and try again."
@@ -666,7 +698,9 @@ def check_package_vulnerabilities(package_name: str, ecosystem: str = "PyPI") ->
 def _parse_github_url(repo_url: str) -> tuple:
     """Returns (owner/repo slug, None) or (None, error_message)."""
     url = repo_url.strip().rstrip("/")
-    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+    if url.startswith("http://"):
+        return None, "Please use an https:// GitHub URL — plain http:// is not accepted."
+    for prefix in ("https://github.com/", "github.com/"):
         if url.startswith(prefix):
             url = url[len(prefix):]
             break
@@ -795,7 +829,9 @@ def scan_github_url(repo_url: str) -> str:
                 if name == "Dockerfile" and docker_file is None:
                     docker_file = str(file_path)
 
-            except Exception:
+            except Exception as _dl_err:
+                import sys as _sys
+                print(f"[vibesec] download skip {path}: {_dl_err}", file=_sys.stderr)
                 continue
 
         if not downloaded:

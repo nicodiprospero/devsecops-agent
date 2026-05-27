@@ -3,10 +3,14 @@
 VibeSec — Flask Web Interface
 """
 
+import html as html_mod
 import os
 import re
+import shutil
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -23,16 +27,46 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(32).hex())
+
+_flask_secret = os.getenv("FLASK_SECRET_KEY")
+if not _flask_secret:
+    import warnings
+    _flask_secret = os.urandom(32).hex()
+    warnings.warn(
+        "FLASK_SECRET_KEY is not set — using a random key. "
+        "All sessions will be invalidated on restart. Set FLASK_SECRET_KEY in .env.",
+        stacklevel=1,
+    )
+app.secret_key = _flask_secret
+
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB upload limit
 
 from agent import create_agent
+
+# Server-side report store — keeps large scan outputs out of the 4 KB cookie.
+# Keys are session_id strings; values are {"content": str, "mode": str}.
+_report_store: dict[str, dict] = {}
 
 
 # ── Simple markdown → HTML for export reports ──────────────────────────────────
 
 def _md_to_html(text: str) -> str:
-    text = re.sub(r"```[\w]*\n(.*?)```", r"<pre><code>\1</code></pre>", text, flags=re.DOTALL)
+    # Extract code blocks before escaping so their content is preserved literally.
+    code_blocks: list[str] = []
+    placeholder = "\x00CODE\x00"
+
+    def _stash(m: re.Match) -> str:
+        code_blocks.append(html_mod.escape(m.group(1)))
+        return placeholder
+
+    text = re.sub(r"```[\w]*\n(.*?)```", _stash, text, flags=re.DOTALL)
+    text = html_mod.escape(text)
+    out_parts = []
+    for chunk in text.split(placeholder):
+        out_parts.append(chunk)
+        if code_blocks:
+            out_parts.append(f"<pre><code>{code_blocks.pop(0)}</code></pre>")
+    text = "".join(out_parts)
     text = re.sub(r"^### (.+)$", r"<h3>\1</h3>", text, flags=re.MULTILINE)
     text = re.sub(r"^## (.+)$",  r"<h2>\1</h2>", text, flags=re.MULTILINE)
     text = re.sub(r"^# (.+)$",   r"<h1>\1</h1>", text, flags=re.MULTILINE)
@@ -174,6 +208,26 @@ def _render_export_html(content: str, mode: str, date_str: str, session_id: str)
 </html>"""
 
 
+# ── Security headers ───────────────────────────────────────────────────────────
+
+@app.after_request
+def _security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"]        = "DENY"
+    response.headers["Referrer-Policy"]        = "strict-origin-when-cross-origin"
+    # Permit fonts.googleapis.com for the export report stylesheet.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "frame-ancestors 'none';"
+    )
+    return response
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -216,8 +270,7 @@ def chat():
     except Exception as exc:
         return jsonify({"error": f"Agent error: {exc}"}), 500
 
-    session["last_response"]      = content
-    session["last_response_mode"] = mode
+    _report_store[session_id] = {"content": content, "mode": mode}
 
     return jsonify({"response": content, "session_id": session_id})
 
@@ -281,20 +334,20 @@ def upload_file():
     except Exception as exc:
         return jsonify({"error": f"Agent error: {exc}"}), 500
 
-    session["last_response"]      = content
-    session["last_response_mode"] = mode
+    _report_store[session_id] = {"content": content, "mode": mode}
 
     return jsonify({"response": content, "filename": safe_name, "session_id": session_id})
 
 
 @app.route("/export")
 def export_report():
-    content = session.get("last_response", "")
-    if not content:
+    session_id = session.get("session_id", "unknown")
+    report     = _report_store.get(session_id)
+    if not report:
         return "No report to export yet. Run a scan first, then click Export.", 400
 
-    mode       = session.get("last_response_mode", "vibe")
-    session_id = session.get("session_id", "unknown")
+    content = report["content"]
+    mode    = report["mode"]
     date_str   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     html = _render_export_html(content, mode, date_str, session_id)
@@ -307,10 +360,11 @@ def export_report():
 
 @app.route("/new-session", methods=["POST"])
 def new_session():
+    old_id = session.get("session_id")
+    if old_id:
+        _report_store.pop(old_id, None)
     session["session_id"] = str(uuid.uuid4())[:8]
     session["mode"]       = "vibe"
-    session.pop("last_response", None)
-    session.pop("last_response_mode", None)
     return jsonify({"session_id": session["session_id"]})
 
 
@@ -319,10 +373,28 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def _cleanup_uploads(max_age_seconds: int = 3600) -> None:
+    """Delete upload session directories older than max_age_seconds."""
+    uploads_root = Path(tempfile.gettempdir()) / "vibesec_uploads"
+    while True:
+        time.sleep(max_age_seconds)
+        if not uploads_root.exists():
+            continue
+        now = time.time()
+        for child in uploads_root.iterdir():
+            try:
+                if now - child.stat().st_mtime > max_age_seconds:
+                    shutil.rmtree(child, ignore_errors=True)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     if not os.getenv("GEMINI_API_KEY"):
         print("\n[ERROR] GEMINI_API_KEY is not set in .env\n")
         raise SystemExit(1)
+
+    threading.Thread(target=_cleanup_uploads, daemon=True).start()
 
     port  = int(os.getenv("FLASK_PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
