@@ -396,7 +396,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=_cleanup_uploads, daemon=True).start()
 
-    port  = int(os.getenv("FLASK_PORT", 5000))
+    port  = int(os.getenv("PORT", os.getenv("FLASK_PORT", 5000)))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     print(f"\n  VibeSec running → http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=debug)

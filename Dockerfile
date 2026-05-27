@@ -28,11 +28,13 @@ RUN useradd -m -u 1000 -s /bin/sh vibesec \
 
 USER vibesec
 
-# Web interface port
-EXPOSE 5000
+# Railway injects $PORT; fall back to 5000 for local runs
+ENV PORT=5000
+
+EXPOSE $PORT
 
 # Liveness check against the /health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
+  CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://localhost:{os.getenv(\"PORT\",5000)}/health')" || exit 1
 
-CMD ["python", "app.py"]
+CMD gunicorn --bind "0.0.0.0:${PORT}" --workers 2 --timeout 120 app:app
